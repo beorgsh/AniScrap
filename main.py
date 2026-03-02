@@ -66,11 +66,44 @@ class AnimePahe:
         try:
             if referer: await page.set_extra_http_headers({"Referer": referer})
             response = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            if "Just a moment" in await page.title(): 
-                print("Cloudflare verification active, Waiting...")
-                await page.wait_for_timeout(5000) 
+            
+            # Upgraded Wait Loop: Keeps checking if Cloudflare is still active
+            for _ in range(4):
+                title = await page.title()
+                if "Just a moment" in title or "Cloudflare" in title: 
+                    print(f"Cloudflare verification active on {url}, Waiting...")
+                    await page.wait_for_timeout(5000) 
+                else:
+                    break
             return response
-        except Exception as e: print(f"Navigation Error: {e}")
+        except Exception as e: 
+            print(f"Navigation Error: {e}")
+
+    # --- NEW HELPER METHODS TO SAFELY BYPASS CLOUDFLARE ---
+
+    async def _fetch_json(self, url: str):
+        page = await self.context.new_page()
+        try:
+            await self._safe_goto(page, url)
+            # Safely grab the text out of the document, avoiding HTML wrappers
+            content = await page.evaluate("document.body ? document.body.innerText : document.documentElement.innerText")
+            return json.loads(content)
+        except Exception as e:
+            print(f"JSON Parse Blocked: {e}")
+            return None
+        finally:
+            await page.close()
+
+    async def _fetch_html(self, url: str):
+        page = await self.context.new_page()
+        try:
+            await self._safe_goto(page, url)
+            return await page.content()
+        except Exception as e:
+            print(f"HTML Fetch Blocked: {e}")
+            return ""
+        finally:
+            await page.close()
 
     def _convert_m3u8_to_mp4(self, m3u8_url: Optional[str], generated_filename: str) -> Optional[str]:
         if not m3u8_url: return None
@@ -85,27 +118,27 @@ class AnimePahe:
     
     async def get_latest_episodes(self, page_num: int = 1):
         url = f"{BASE_URL}/api?m=airing&page={page_num}"
-        resp = await self.context.request.get(url)
-        try: return await resp.json()
-        except json.JSONDecodeError: return {"error": "Cloudflare cache blocked payload. Clear on browser request."}
+        data = await self._fetch_json(url)
+        if not data: return {"error": "Cloudflare cache blocked payload. Clear on browser request."}
+        return data
 
     async def search(self, query: str):
-        resp = await self.context.request.get(f"{BASE_URL}/api?m=search&q={query}")
-        try: return (await resp.json()).get("data",[])
-        except json.JSONDecodeError: return {"error": "Search payload was Cloudflare blocked."}
+        url = f"{BASE_URL}/api?m=search&q={query}"
+        data = await self._fetch_json(url)
+        if not data: return {"error": "Search payload was Cloudflare blocked."}
+        return data.get("data",[])
 
     async def get_episodes(self, anime_session: str, page_num: int = 1, sort: str = "episode_desc"):
         url = f"{BASE_URL}/api?m=release&id={anime_session}&sort={sort}&page={page_num}"
-        resp = await self.context.request.get(url)
-        try: return await resp.json()
-        except json.JSONDecodeError: return {"error": "Pagination Chunk block encountered."}
+        data = await self._fetch_json(url)
+        if not data: return {"error": "Pagination Chunk block encountered."}
+        return data
 
     async def get_anime_info(self, anime_session: str, page_num: int = 1):
         url = f"{BASE_URL}/anime/{anime_session}"
-        resp = await self.context.request.get(url)
-        content = await resp.text()
+        content = await self._fetch_html(url)
 
-        if "Just a moment" in content: 
+        if not content or "Just a moment" in content: 
             return {"error": "Cloudflare triggered. Fix once on frontend visually in headless=False cache directory."}
 
         def scrape_strong(label: str):
@@ -147,10 +180,10 @@ class AnimePahe:
         ids = {
             "animepahe_id": animepahe_id,
             "mal_id": int((re.search(r'myanimelist\.net/anime/(\d+)', content) or [0, 0])[1] or 0) or None,
-            "anilist_id": int((re.search(r'anilist\.co/anime/(\d+)', content) or[0, 0])[1] or 0) or None,
-            "ann_id": int((re.search(r'animenewsnetwork\.com/encyclopedia/anime\.php\?id=(\d+)', content) or[0, 0])[1] or 0) or None,
+            "anilist_id": int((re.search(r'anilist\.co/anime/(\d+)', content) or [0, 0])[1] or 0) or None,
+            "ann_id": int((re.search(r'animenewsnetwork\.com/encyclopedia/anime\.php\?id=(\d+)', content) or [0, 0])[1] or 0) or None,
             "kitsu": (re.search(r'kitsu\.io/anime/([^/"\'<>\s]+)', content) or [None, None])[1],
-            "anime_planet": (re.search(r'anime-planet\.com/anime/([^/"\'<>\s]+)', content) or [None, None])[1]
+            "anime_planet": (re.search(r'anime-planet\.com/anime/([^/"\'<>\s]+)', content) or[None, None])[1]
         }
 
         return {
@@ -162,7 +195,7 @@ class AnimePahe:
             "status": scrape_strong("Status"),
             "studio": scrape_strong("Studio"),
             "season": scrape_strong("Season"),
-            "youtube_trailer": f"https://www.youtube.com/watch?v={yt_match.group(1)}" if yt_match else None,
+            "youtube_trailer": f"https://youtube.com/watch?v={yt_match.group(1)}" if yt_match else None,
             "genres": genres,
             "ids": ids,
             "episodes": episodes_chunk
