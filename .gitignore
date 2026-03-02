@@ -1,0 +1,12 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Playwright Browser Data
+browser_data/
+browser_profile/
+
+# Virtual Environments
+.venv/
+venv/
+env/

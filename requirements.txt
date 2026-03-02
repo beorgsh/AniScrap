@@ -1,13 +1,3 @@
-# HTTP client
-tls-client
-
-# Run JS 
-PyExecJS
-
-# HTML parsing
-beautifulsoup4
-
-# FastAPI + ASGI server to run it
-fastapi
-uvicorn
-
+fastapi>=0.109.0
+uvicorn>=0.27.0
+playwright>=1.42.0
