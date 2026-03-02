@@ -1,5 +1,11 @@
 # AnimePahe Universal Extractor API 🎬
 
+[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/new?template=https://github.com/beorgsh/animepahe-api)
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/beorgsh/animepahe-api)
+
+[![Deploy to Koyeb](https://www.koyeb.com/static/images/deploy/button.svg)](https://app.koyeb.com/deploy?type=git&repository=github.com/beorgsh/animepahe-api)
+
 A blazing-fast, concurrent API built with **FastAPI** and **Playwright** to seamlessly extract search results, anime information, episodes, and direct raw streaming M3U8/MP4 links from AnimePahe.
 
 Includes built-in Cloudflare bypass logic, ad-network blocking, and deep API pagination search engines.
@@ -22,13 +28,11 @@ Includes built-in Cloudflare bypass logic, ad-network blocking, and deep API pag
    ```
 
 2. **Install the required Python dependencies**:
-
    ```bash
    pip install -r requirements.txt
    ```
 
 3. **Install Playwright browser binaries**:
-
    ```bash
    playwright install chromium
    ```
@@ -48,13 +52,23 @@ Includes built-in Cloudflare bypass logic, ad-network blocking, and deep API pag
 
 This repository includes a Dockerfile utilizing Microsoft's official Playwright image. This guarantees all Linux browser dependencies are pre-installed.
 
-### How to deploy on Render.com:
+### 1-Click Deployments
+
+Click any of the buttons below to automatically link your GitHub account and deploy the Docker container:
+
+[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/new?template=https://github.com/beorgsh/animepahe-api)
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/beorgsh/animepahe-api)
+
+[![Deploy to Koyeb](https://www.koyeb.com/static/images/deploy/button.svg)](https://app.koyeb.com/deploy?type=git&repository=github.com/beorgsh/animepahe-api)
+
+### Manual Deployment (Render.com Example):
 
 1. Upload this project to your GitHub.
 2. Go to Render and create a new **Web Service**.
 3. Connect your GitHub repository.
 4. Render will automatically detect the `Dockerfile` and build the container perfectly.
-5. _(Optional)_ Set the `PORT` environment variable if required by the host.
+5. *(Optional)* Set the `PORT` environment variable if required by the host.
 
 ## 📡 API Endpoints
 
@@ -67,7 +81,7 @@ This repository includes a Dockerfile utilizing Microsoft's official Playwright 
 
 ## 5. .gitignore
 
-_(Copy and paste this into `.gitignore`. This stops you from accidentally uploading local junk files/browser data to GitHub)._
+*(Copy and paste this into `.gitignore`. This stops you from accidentally uploading local junk files/browser data to GitHub).*
 
 ```text
 # Byte-compiled / optimized / DLL files
