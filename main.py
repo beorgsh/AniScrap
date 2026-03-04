@@ -9,6 +9,9 @@ from playwright.async_api import async_playwright, BrowserContext
 BASE_URL = "https://animepahe.si"
 IS_HEADLESS = os.environ.get("HEADLESS", "true").lower() == "true"
 
+# Detect if running on low-resource environment (Render free = 512MB)
+IS_LOW_RESOURCE = os.environ.get("LOW_RESOURCE", "true").lower() == "true"
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Accept": "text/html,application/json,*/*",
@@ -22,7 +25,13 @@ http: httpx.AsyncClient = None
 browser_context: BrowserContext = None
 playwright_instance = None
 cf_cookies: dict = {}
+cf_cookie_age: float = 0
 cf_lock = asyncio.Lock()
+
+# On free tier: only 1 browser page at a time to avoid OOM
+# On paid tier: up to 3 concurrent
+KWIK_CONCURRENCY = 1 if IS_LOW_RESOURCE else 3
+kwik_semaphore: asyncio.Semaphore = None
 
 
 # ─────────────────────────────────────────────
@@ -30,7 +39,9 @@ cf_lock = asyncio.Lock()
 # ─────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global http, browser_context, playwright_instance
+    global http, browser_context, playwright_instance, kwik_semaphore
+
+    kwik_semaphore = asyncio.Semaphore(KWIK_CONCURRENCY)
 
     http = httpx.AsyncClient(
         headers=HEADERS,
@@ -49,20 +60,26 @@ async def lifespan(app: FastAPI):
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
             "--disable-dev-shm-usage",
+            "--disable-gpu",                        # ⚡ no GPU needed
+            "--disable-software-rasterizer",        # ⚡ save CPU
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--js-flags=--max-old-space-size=256",  # ⚡ limit JS heap
         ]
     )
 
-    # Block heavy assets globally to keep browser pages fast
+    # Block everything except scripts and XHR globally
     await browser_context.route(
         "**/*",
         lambda route: route.abort()
-        if route.request.resource_type in ("image", "stylesheet", "font", "media")
+        if route.request.resource_type in ("image", "stylesheet", "font", "media", "other")
         else route.continue_()
     )
 
-    # Pre-warm CF cookies on startup
     await refresh_cf_cookies()
     asyncio.create_task(keep_alive())
+    asyncio.create_task(cookie_refresher())
 
     yield
 
@@ -75,7 +92,7 @@ async def lifespan(app: FastAPI):
 #  Cloudflare cookie management
 # ─────────────────────────────────────────────
 async def refresh_cf_cookies():
-    global cf_cookies
+    global cf_cookies, cf_cookie_age
     async with cf_lock:
         print("Refreshing Cloudflare cookies...")
         page = await browser_context.new_page()
@@ -89,6 +106,7 @@ async def refresh_cf_cookies():
                     break
             cookies = await browser_context.cookies()
             cf_cookies = {c["name"]: c["value"] for c in cookies}
+            cf_cookie_age = asyncio.get_event_loop().time()
             print(f"CF cookies refreshed: {list(cf_cookies.keys())}")
         except Exception as e:
             print(f"CF cookie refresh error: {e}")
@@ -96,21 +114,37 @@ async def refresh_cf_cookies():
             await page.close()
 
 
-async def get_cf_headers() -> dict:
-    if not cf_cookies:
+async def ensure_cf_cookies():
+    """Refresh only if cookies are older than 30 minutes."""
+    now = asyncio.get_event_loop().time()
+    if not cf_cookies or (now - cf_cookie_age) > 1800:
         await refresh_cf_cookies()
+
+
+async def get_cf_headers() -> dict:
+    await ensure_cf_cookies()
     cookie_str = "; ".join(f"{k}={v}" for k, v in cf_cookies.items())
     return {**HEADERS, "Cookie": cookie_str}
+
+
+async def cookie_refresher():
+    """Proactively refresh CF cookies every 25 min — never blocks a request."""
+    await asyncio.sleep(60)
+    while True:
+        await asyncio.sleep(25 * 60)
+        try:
+            await refresh_cf_cookies()
+        except Exception as e:
+            print(f"Background cookie refresh failed: {e}")
 
 
 # ─────────────────────────────────────────────
 #  HTTP helpers
 # ─────────────────────────────────────────────
 async def api_get(path: str):
-    """JSON API — tries plain first, refreshes CF cookies on 403."""
     r = await http.get(
         f"{BASE_URL}{path}",
-        headers={**HEADERS, "Accept": "application/json"}
+        headers={**(await get_cf_headers()), "Accept": "application/json"}
     )
     if r.status_code == 403:
         await refresh_cf_cookies()
@@ -123,7 +157,6 @@ async def api_get(path: str):
 
 
 async def html_get_cf(url: str) -> str:
-    """HTML pages protected by CF — uses browser cookies via httpx."""
     r = await http.get(url, headers=await get_cf_headers())
     if r.status_code == 403:
         await refresh_cf_cookies()
@@ -137,78 +170,69 @@ async def html_get_cf(url: str) -> str:
 # ─────────────────────────────────────────────
 async def resolve_kwik(embed_url: str) -> str | None:
     """
-    Kwik embeds use obfuscated JS to generate the m3u8 URL.
-    We use a browser page to intercept the network request.
-    Everything else in the app uses httpx — browser only used here.
+    Uses a single browser page to intercept the JS-generated m3u8 request.
+    Semaphore limits concurrent pages to avoid OOM on free tier.
     """
-    page = await browser_context.new_page()
-    try:
-        m3u8_future = asyncio.get_event_loop().create_future()
-
-        def handle_request(request):
-            if ".m3u8" in request.url and not m3u8_future.done():
-                m3u8_future.set_result(request.url)
-
-        page.on("request", handle_request)
-
-        # Block media/images inside kwik to speed up load
-        await page.route(
-            "**/*",
-            lambda route: route.abort()
-            if route.request.resource_type in ("image", "stylesheet", "font", "media", "other")
-            else route.continue_()
-        )
-
-        await page.set_extra_http_headers({"Referer": BASE_URL})
-        await page.goto(embed_url, wait_until="domcontentloaded", timeout=15000)
-
-        # Auto-click to trigger playback and JS player init
-        async def auto_clicker():
-            while not m3u8_future.done():
-                try:
-                    await page.evaluate(
-                        "document.querySelectorAll("
-                        "'button, .plyr__poster, video, [class*=play], form, input[type=\"submit\"]'"
-                        ").forEach(el => el.click())"
-                    )
-                except Exception:
-                    pass
-                await asyncio.sleep(0.3)
-
-        click_task = asyncio.create_task(auto_clicker())
+    async with kwik_semaphore:
+        page = await browser_context.new_page()
         try:
-            return await asyncio.wait_for(m3u8_future, timeout=8.0)
-        except asyncio.TimeoutError:
-            print(f"Kwik timeout for {embed_url}")
+            m3u8_future = asyncio.get_event_loop().create_future()
+
+            def handle_request(request):
+                if ".m3u8" in request.url and not m3u8_future.done():
+                    m3u8_future.set_result(request.url)
+
+            page.on("request", handle_request)
+
+            await page.route(
+                "**/*",
+                lambda route: route.abort()
+                if route.request.resource_type in ("image", "stylesheet", "font", "media", "other")
+                else route.continue_()
+            )
+
+            await page.set_extra_http_headers({"Referer": BASE_URL})
+            await page.goto(embed_url, wait_until="domcontentloaded", timeout=15000)
+
+            async def auto_clicker():
+                while not m3u8_future.done():
+                    try:
+                        await page.evaluate(
+                            "document.querySelectorAll("
+                            "'button, .plyr__poster, video, [class*=play], form, input[type=\"submit\"]'"
+                            ").forEach(el => el.click())"
+                        )
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.3)
+
+            click_task = asyncio.create_task(auto_clicker())
+            try:
+                return await asyncio.wait_for(m3u8_future, timeout=8.0)
+            except asyncio.TimeoutError:
+                print(f"Kwik timeout for {embed_url}")
+                return None
+            finally:
+                click_task.cancel()
+
+        except Exception as e:
+            print(f"Kwik resolve error for {embed_url}: {e}")
             return None
         finally:
-            click_task.cancel()
-
-    except Exception as e:
-        print(f"Kwik resolve error for {embed_url}: {e}")
-        return None
-    finally:
-        page.remove_listener("request", handle_request)
-        await page.close()
+            page.remove_listener("request", handle_request)
+            await page.close()
 
 
 # ─────────────────────────────────────────────
 #  Download URL builder
 # ─────────────────────────────────────────────
 def build_download_url(m3u8_url: str | None, filename: str) -> str | None:
-    """
-    Convert kwik m3u8 stream URL to direct mp4 download URL.
-    Handles all known CDN patterns:
-      https://na-1.cdn.kwik.cx/stream/{id}/{res}/index.m3u8
-      https://eu-2.cdn.kwik.cx/hls/stream/{id}/{res}/index.m3u8
-    """
     if not m3u8_url:
         return None
     m = re.search(r'https?://([^/]+)/(?:hls/)?stream/([a-zA-Z0-9]+)', m3u8_url)
     if m:
         host = m.group(1)
         stream_id = m.group(2)
-        # Strip leading subdomain to get base CDN domain
         base = re.sub(r'^[^.]+\.', '', host)
         return f"https://{base}/mp4/{stream_id}?file={filename}"
     return None
@@ -241,37 +265,24 @@ async def root():
     return {"message": "AnimePahe Hybrid API — lightweight + Cloudflare ready!"}
 
 
-# ─────────────────────────────────────────────
-#  Search
-# ─────────────────────────────────────────────
 @app.get("/search")
 async def search(q: str):
     data = await api_get(f"/api?m=search&q={q}")
     return data.get("data", [])
 
 
-# ─────────────────────────────────────────────
-#  Latest episodes
-# ─────────────────────────────────────────────
 @app.get("/latest")
 async def latest(p: int = 1):
     return await api_get(f"/api?m=airing&page={p}")
 
 
-# ─────────────────────────────────────────────
-#  Episode list
-# ─────────────────────────────────────────────
 @app.get("/episodes/{anime_session}")
 async def episodes(anime_session: str, p: int = 1, sort: str = "episode_desc"):
     return await api_get(f"/api?m=release&id={anime_session}&sort={sort}&page={p}")
 
 
-# ─────────────────────────────────────────────
-#  Anime info
-# ─────────────────────────────────────────────
 @app.get("/info/{anime_session}")
 async def info(anime_session: str, p: int = 1):
-    # Fetch HTML and episodes simultaneously
     html, eps = await asyncio.gather(
         html_get_cf(f"{BASE_URL}/anime/{anime_session}"),
         api_get(f"/api?m=release&id={anime_session}&sort=episode_desc&page={p}")
@@ -342,21 +353,17 @@ async def info(anime_session: str, p: int = 1):
     }
 
 
-# ─────────────────────────────────────────────
-#  Resolve stream
-# ─────────────────────────────────────────────
 @app.get("/resolve/{anime_session}/{episode_session}")
 async def resolve(anime_session: str, episode_session: str):
 
     async def get_embeds():
-        """Fetch /play page via httpx+CF cookies and parse embed buttons."""
         html = await html_get_cf(f"{BASE_URL}/play/{anime_session}/{episode_session}")
         results = []
         for m in re.finditer(
             r'<button[^>]+data-src="([^"]+)"[^>]+data-fansub="([^"]*)"[^>]+data-resolution="([^"]*)"[^>]+data-audio="([^"]*)"',
             html
         ):
-            embed = m.group(1)
+            embed  = m.group(1)
             fan_sub = m.group(2)
             resolution = m.group(3)
             audio = m.group(4)
@@ -371,7 +378,6 @@ async def resolve(anime_session: str, episode_session: str):
         return results
 
     async def get_episode_num():
-        """Get episode number from API without loading the full anime info page."""
         chunk = await api_get(
             f"/api?m=release&id={anime_session}&sort=episode_desc&page=1"
         )
@@ -381,40 +387,66 @@ async def resolve(anime_session: str, episode_session: str):
                     return str(ep.get("episode")), ep.get("anime_id")
         return "Unknown", None
 
-    # ⚡ Fetch embed list + episode number simultaneously
+    # ⚡ Fetch embed list + episode number simultaneously via httpx
     embeds, (episode_num, ap_id) = await asyncio.gather(
         get_embeds(),
         get_episode_num()
     )
 
-    # ⚡ Resolve all kwik embeds in parallel (browser intercepts JS-generated m3u8)
-    semaphore = asyncio.Semaphore(3)
+    # On free tier: resolve only the best quality per audio type
+    # to cut browser time from 6 pages → 2 pages
+    if IS_LOW_RESOURCE:
+        seen = {}
+        filtered = []
+        # Pick highest resolution per audio type (sub + dub)
+        for e in sorted(embeds, key=lambda x: int(x["resolution"]) if x["resolution"].isdigit() else 0, reverse=True):
+            key = "dub" if e["isDub"] else "sub"
+            if key not in seen:
+                seen[key] = True
+                filtered.append(e)
+        # Also add 720p as fallback for each type
+        for e in sorted(embeds, key=lambda x: int(x["resolution"]) if x["resolution"].isdigit() else 0, reverse=True):
+            key = f"{('dub' if e['isDub'] else 'sub')}_720"
+            if e["resolution"] == "720" and key not in seen:
+                seen[key] = True
+                filtered.append(e)
+        embeds_to_resolve = filtered
+    else:
+        embeds_to_resolve = embeds
 
     async def extract(item):
-        async with semaphore:
-            m3u8 = await resolve_kwik(item["embed"])
-            filename = (
-                f"AnimePahe_{anime_session}"
-                f"_-_{episode_num}"
-                f"_{item['resolution']}p"
-                f"_{'DUB' if item['isDub'] else item['fanSub'].replace(' ', '')}"
-                f".mp4"
-            )
-            return {
-                "url": m3u8,
-                "isM3U8": True,
-                "embed": item["embed"],
-                "resolution": item["resolution"],
-                "isDub": item["isDub"],
-                "fanSub": item["fanSub"],
-                "download": build_download_url(m3u8, filename)
-            }
+        m3u8 = await resolve_kwik(item["embed"])
+        filename = (
+            f"AnimePahe_{anime_session}"
+            f"_-_{episode_num}"
+            f"_{item['resolution']}p"
+            f"_{'DUB' if item['isDub'] else item['fanSub'].replace(' ', '')}"
+            f".mp4"
+        )
+        return {
+            "url": m3u8,
+            "isM3U8": True,
+            "embed": item["embed"],
+            "resolution": item["resolution"],
+            "isDub": item["isDub"],
+            "fanSub": item["fanSub"],
+            "download": build_download_url(m3u8, filename)
+        }
 
-    sources = await asyncio.gather(*[extract(e) for e in embeds])
+    # On free tier semaphore=1 so this runs sequentially
+    # On paid tier semaphore=3 so runs in parallel
+    sources = await asyncio.gather(*[extract(e) for e in embeds_to_resolve])
 
-    # Split into sub and dub for easy frontend consumption
-    sub_sources = [s for s in sources if not s["isDub"]]
-    dub_sources = [s for s in sources if s["isDub"]]
+    sub_sources = sorted(
+        [s for s in sources if not s["isDub"]],
+        key=lambda x: int(x["resolution"]) if x["resolution"].isdigit() else 0,
+        reverse=True
+    )
+    dub_sources = sorted(
+        [s for s in sources if s["isDub"]],
+        key=lambda x: int(x["resolution"]) if x["resolution"].isdigit() else 0,
+        reverse=True
+    )
 
     return {
         "ids": {"animepahe_id": ap_id},
