@@ -157,12 +157,39 @@ async def api_get(path: str):
 
 
 async def html_get_cf(url: str) -> str:
+    """Try httpx first (fast). If 403, fall back to real browser page."""
     r = await http.get(url, headers=await get_cf_headers())
-    if r.status_code == 403:
-        await refresh_cf_cookies()
-        r = await http.get(url, headers=await get_cf_headers())
-    r.raise_for_status()
-    return r.text
+    if r.status_code == 200:
+        return r.text
+
+    # httpx failed — use actual browser to load the page
+    print(f"httpx got {r.status_code} for {url}, falling back to browser...")
+    return await html_get_browser(url)
+
+
+async def html_get_browser(url: str) -> str:
+    """Load a page via real browser and return HTML. Updates CF cookies as side effect."""
+    async with kwik_semaphore:
+        page = await browser_context.new_page()
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            for _ in range(6):
+                title = await page.title()
+                if "Just a moment" in title or "Cloudflare" in title:
+                    await page.wait_for_timeout(4000)
+                else:
+                    break
+            # Sync fresh cookies back to cf_cookies
+            cookies = await browser_context.cookies()
+            global cf_cookies, cf_cookie_age
+            cf_cookies = {c["name"]: c["value"] for c in cookies}
+            cf_cookie_age = asyncio.get_event_loop().time()
+            return await page.content()
+        except Exception as e:
+            print(f"Browser page load error for {url}: {e}")
+            raise
+        finally:
+            await page.close()
 
 
 # ─────────────────────────────────────────────
